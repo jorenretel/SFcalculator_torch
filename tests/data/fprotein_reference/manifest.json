@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "0b583b837c5ed94994e239669260c3d8c61fa1b7",
+  "source_sha256": {
+    "Fmodel.py": "eaabefed8161420e1e05b25b5bf53db4fdf835f46e92a6d069ba763296f60a1a",
+    "utils.py": "3524017de20cce10b8e336294f8f2324145e35faafc5da15d855b06a58f78b08",
+    "symmetry.py": "f83690b8260be22589df4cd63c4440a8cbfdc1cb0b773eb2eae8c2feee5ec5bb",
+    "io.py": "cda2783eee3fbd9bd8a9d95ca472d794a5dfadf405d96c16db4be1370e974a07"
+  },
+  "seed": 20261109,
+  "device": "cpu",
+  "threads": 1,
+  "versions": {
+    "python": "3.12.16",
+    "torch": "2.14.1",
+    "numpy": "1.26.4",
+    "gemmi": "0.6.7",
+    "reciprocalspaceship": "1.0.3"
+  },
+  "model_source": {
+    "file": "1lj5.pdb",
+    "sha256": "8985a66c413509b8792f22fea47b6379c63bcc6ee95fdd034526549deb0eae7b",
+    "public_target": "1LJ5",
+    "target_url": "https://www.rcsb.org/structure/1LJ5",
+    "description": "Aligned predicted model from the public 1LJ5 tutorial target; only coordinate, displacement, cell, and terminator records retained. Electron scattering in P1 is a test setup, not experimental data."
+  },
+  "cases": {
+    "cryo_1lj5": {
+      "sha256": "8961a0eb7380083c503c32d8b2abccf139f84f00600124550ee2c74d8641466a",
+      "atoms": 3012,
+      "reflections": 257,
+      "asu_reflections": 257,
+      "symmetry_operations": 1
+    },
+    "cryo_p1_iso": {
+      "sha256": "42675a23cf4e653320f7a1ad6ec75353d96cb671bb1c499c8515adbd4ad805dc",
+      "atoms": 11,
+      "reflections": 257,
+      "asu_reflections": 257,
+      "symmetry_operations": 1
+    },
+    "cryo_p21_mixed": {
+      "sha256": "8b0039737d25ca2908ac2c32bdbf2b02c85b00c7bf2d74c4c63527de5fede070",
+      "atoms": 11,
+      "reflections": 257,
+      "asu_reflections": 257,
+      "symmetry_operations": 2
+    },
+    "xray_p212121_mixed": {
+      "sha256": "ce7abccceab089b8a37b35cbbdefa6e4fe2eca084a83653cc27bdf532ad14b94",
+      "atoms": 11,
+      "reflections": 257,
+      "asu_reflections": 1128,
+      "symmetry_operations": 4
+    },
+    "xray_p1_anomalous": {
+      "sha256": "ffe84c6cf87a94e4f289409c37db9c2d1a92209dd7635dd3463bb26aefa115be",
+      "atoms": 11,
+      "reflections": 257,
+      "asu_reflections": 7660,
+      "symmetry_operations": 1
+    }
+  }
+}
