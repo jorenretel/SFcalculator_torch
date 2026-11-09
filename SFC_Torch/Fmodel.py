@@ -28,6 +28,7 @@ from .utils import r_factor, assert_numpy, assert_tensor
 from .packingscore import packingscore_voxelgrid_torch
 from .io import PDBParser
 from .streaming import f_protein_streamed
+from .compiled import f_protein_compiled
 
 class SFcalculator(object):
     """
@@ -97,14 +98,15 @@ class SFcalculator(object):
 
         fprotein_backend: str, default streamed
             Stream reflection tiles with recomputation-based autograd, or use
-            the legacy dense calculation with "dense".
+            the legacy dense calculation with "dense". "compiled" opts into a
+            CUDA Inductor tile kernel (first-order gradients only).
 
         reflection_chunk_size: int, default 2048
             Positive number of reflections per streamed tile. Backward recomputes
             tiles rather than retaining their dense atom-by-reflection tensors.
         """
-        if fprotein_backend not in ("streamed", "dense"):
-            raise ValueError("fprotein_backend must be 'streamed' or 'dense'")
+        if fprotein_backend not in ("streamed", "dense", "compiled"):
+            raise ValueError("fprotein_backend must be 'streamed', 'dense', or 'compiled'")
         if isinstance(reflection_chunk_size, (bool, np.bool_)) or not isinstance(
             reflection_chunk_size, Integral
         ):
@@ -575,6 +577,25 @@ class SFcalculator(object):
             device=self.device,
         )
         self._fullsf_tensor = None
+        self._compiled_reciprocal_inputs = None
+
+    def _get_compiled_reciprocal_inputs(self):
+        """Keep device-local inputs, checking snapshots for public NumPy edits."""
+        cache = self._compiled_reciprocal_inputs
+        device = self.atom_pos_orth.device
+        if (
+            cache is None
+            or cache[2].device != device
+            or not np.array_equal(cache[0], self.Hasu_array)
+            or not np.array_equal(cache[1], self.dr2asu_array)
+        ):
+            # Cached constants can be reused by training after inference calls.
+            with torch.inference_mode(False):
+                hkl = torch.tensor(self.Hasu_array, dtype=torch.float32, device=device)
+                dr2 = torch.tensor(self.dr2asu_array, dtype=torch.float32, device=device)
+            cache = (self.Hasu_array.copy(), self.dr2asu_array.copy(), hkl, dr2)
+            self._compiled_reciprocal_inputs = cache
+        return cache[2], cache[3]
 
     @property
     def fullsf_tensor(self):
@@ -733,7 +754,23 @@ class SFcalculator(object):
         if not atoms_occ_tensor is None:
             self.atom_occ = atoms_occ_tensor
 
-        if self.fprotein_backend == "streamed" and self._fullsf_tensor is None:
+        if self.fprotein_backend == "compiled" and self._fullsf_tensor is None:
+            hkl, dr2 = self._get_compiled_reciprocal_inputs()
+            self.Fprotein_asu = f_protein_compiled(
+                hkl,
+                dr2,
+                self._scattering_by_type,
+                self._atom_type_indices,
+                self.R_G_tensor_stack,
+                self.T_G_tensor_stack,
+                self.orth2frac_tensor,
+                self.atom_pos_frac,
+                self.atom_b_iso,
+                self.atom_aniso_uw,
+                self.atom_occ,
+                chunk_size=self.reflection_chunk_size,
+            )
+        elif self.fprotein_backend == "streamed" and self._fullsf_tensor is None:
             self.Fprotein_asu = f_protein_streamed(
                 self.Hasu_array,
                 self.dr2asu_array,
@@ -748,7 +785,7 @@ class SFcalculator(object):
                 self.atom_occ,
                 chunk_size=self.reflection_chunk_size,
             )
-        elif self.fprotein_backend in ("dense", "streamed"):
+        elif self.fprotein_backend in ("dense", "streamed", "compiled"):
             self.Fprotein_asu = F_protein(
                 self.Hasu_array,
                 self.dr2asu_array,
@@ -762,7 +799,7 @@ class SFcalculator(object):
                 self.atom_occ,
             )
         else:
-            raise ValueError("fprotein_backend must be 'streamed' or 'dense'")
+            raise ValueError("fprotein_backend must be 'streamed', 'dense', or 'compiled'")
         if not self.HKL_array is None:
             self.Fprotein_HKL = self.Fprotein_asu[self.asu2HKL_index]
             self.Fmask_HKL = torch.zeros_like(self.Fprotein_HKL)

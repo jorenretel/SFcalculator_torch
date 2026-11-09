@@ -1,4 +1,4 @@
-"""Compare dense and streamed calculations in fresh, sequential processes."""
+"""Compare selected structure-factor backends in fresh, sequential processes."""
 
 import argparse
 import json
@@ -17,18 +17,40 @@ def main():
     parser.add_argument(
         "--modes", nargs="+", choices=("forward", "coordinates", "all"), default=["coordinates"]
     )
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        choices=("dense", "streamed", "compiled"),
+        default=["dense", "streamed"],
+        help="Dense runs once; streamed/compiled run at each chunk size (compiled requires CUDA)",
+    )
     parser.add_argument("--chunks", nargs="+", type=positive_int, default=[2048, 8192])
     parser.add_argument("--repeats", type=positive_int, default=5)
-    parser.add_argument("--timeout", type=positive_int, default=180)
+    parser.add_argument("--warmup", type=positive_int, default=1)
+    parser.add_argument(
+        "--profile", action="store_true", help="Include per-run CUDA kernel summaries"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=positive_int,
+        default=180,
+        help="Per-process seconds; increase for cache-dependent compiled first calls",
+    )
     args = parser.parse_args()
-    for name in ("scales", "modes", "chunks"):
+    for name in ("scales", "modes", "chunks", "backends"):
         values = getattr(args, name)
         if len(set(values)) != len(values):
             parser.error(f"--{name} must not contain duplicates")
+    if "compiled" in args.backends and args.device.split(":", 1)[0] != "cuda":
+        parser.error("The compiled backend requires a CUDA device")
     if args.output_dir.exists():
         parser.error("Sweep output directory already exists; choose a fresh one")
     args.output_dir.mkdir(parents=True)
-    configurations = [("dense", 2048)] + [("streamed", chunk) for chunk in args.chunks]
+    configurations = [
+        (backend, chunk)
+        for backend in args.backends
+        for chunk in ([2048] if backend == "dense" else args.chunks)
+    ]
     rows = []
     failed = False
     source_hashes = None
@@ -56,10 +78,14 @@ def main():
                     str(scale),
                     "--repeats",
                     str(args.repeats),
+                    "--warmup",
+                    str(args.warmup),
                     "--saved-tensors",
                     "--output",
                     str(path),
                 ]
+                if args.profile:
+                    command.append("--profile")
                 print(f"Starting {filename}", flush=True)
                 try:
                     completed = subprocess.run(command, timeout=args.timeout, check=False)
@@ -93,6 +119,8 @@ def main():
                         "backward_ms": summary.get(
                             "backward_cuda_ms", summary.get("backward_wall_ms", {})
                         ).get("median"),
+                        "first_call": report.get("first_call"),
+                        "warmup_summary": report.get("warmup_summary"),
                         "peak_allocated_bytes": summary.get("peak_allocated_bytes"),
                         "saved_storage_bytes": report.get("saved_tensors", {}).get(
                             "unique_storage_bytes"

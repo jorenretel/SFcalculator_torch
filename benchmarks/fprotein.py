@@ -47,7 +47,7 @@ def build_parser():
     parser.add_argument("--case", choices=CASES, default="cryo_1lj5")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--mode", choices=("forward", "coordinates", "all"), default="coordinates")
-    parser.add_argument("--backend", choices=("streamed", "dense"), default="streamed")
+    parser.add_argument("--backend", choices=("streamed", "dense", "compiled"), default="streamed")
     parser.add_argument("--chunk-size", type=positive_int, default=2048)
     parser.add_argument("--repeats", type=positive_int, default=5)
     parser.add_argument("--warmup", type=positive_int, default=1)
@@ -67,6 +67,9 @@ def build_parser():
     )
     parser.add_argument(
         "--saved-tensors", action="store_true", help="Extra untimed autograd-storage inspection"
+    )
+    parser.add_argument(
+        "--profile", action="store_true", help="Extra untimed iteration with a CUDA kernel summary"
     )
     parser.add_argument(
         "--trace", type=Path, help="Extra untimed profiler iteration exported as a Chrome trace"
@@ -270,12 +273,34 @@ def summarize(samples):
     return summary
 
 
+def kernel_summary(profiler):
+    kernels = {}
+    for event in profiler.events():
+        if event.device_type != torch.autograd.DeviceType.CUDA:
+            continue
+        entry = kernels.setdefault(event.name, {"name": event.name, "calls": 0, "total_us": 0.0})
+        entry["calls"] += 1
+        entry["total_us"] += event.time_range.elapsed_us()
+    return {
+        "scope": "Extra post-measurement iteration, including loss projection and validation",
+        "note": (
+            "CUDA device events include copies/memsets when present. Names/counts aid fusion "
+            "inspection; they do not prove fusion or speedup."
+        ),
+        "cuda_kernel_calls": sum(entry["calls"] for entry in kernels.values()),
+        "cuda_kernel_total_us": sum(entry["total_us"] for entry in kernels.values()),
+        "kernels": sorted(kernels.values(), key=lambda entry: entry["total_us"], reverse=True),
+    }
+
+
 def run_benchmark(args):
     if Path(SFC_Torch.__file__).resolve().parent != ROOT / "SFC_Torch":
         raise ValueError("Benchmark must import the source checkout, not an installed wheel")
     meter = Meter(args.device)
     if meter.device.type not in ("cpu", "cuda"):
         raise ValueError("Only CPU and CUDA are supported")
+    if args.backend == "compiled" and not meter.cuda:
+        raise ValueError("The compiled backend requires CUDA; no eager CPU fallback is benchmarked")
     if meter.cuda and not torch.cuda.is_available():
         raise ValueError("CUDA unavailable; use --device cpu only for a harness smoke test")
     data = inputs(args)
@@ -302,6 +327,24 @@ def run_benchmark(args):
             "spacegroup": str(data["spacegroup"]),
             "dtype": "float32/complex64",
         },
+        "measurement_notes": {
+            "first_call": (
+                "First warmup forward/backward in this process, including any lazy setup and JIT "
+                "compilation for compiled. Cache-dependent, not a guaranteed cold compile; "
+                "compiler caches are not cleared. Later calls may also specialize/recompile."
+            ),
+            "steady_state": "samples/summary exclude warmup and profiler/saved-tensor inspection",
+            "timing": (
+                "Wall time includes host work and synchronization. CUDA event intervals can "
+                "include host/JIT idle gaps; they are not summed kernel execution time."
+            ),
+            "memory": (
+                "CUDA PyTorch allocator only; excludes compiler/host and non-PyTorch allocations. "
+                "CPU memory is not measured; reserved memory may persist across phases."
+            ),
+        },
+        "first_call": None,
+        "warmup_samples": [],
         "samples": [],
     }
     active = ["initialization"]
@@ -367,7 +410,11 @@ def run_benchmark(args):
             )
             for _ in range(args.warmup):
                 report["phase"] = "warmup"
-                iteration(calculator, parameters, probe, args.mode, meter, active)
+                sample = iteration(calculator, parameters, probe, args.mode, meter, active)
+                report["warmup_samples"].append(sample)
+                if report["first_call"] is None:
+                    report["first_call"] = sample
+            report["warmup_summary"] = summarize(report["warmup_samples"])
             for _ in range(args.repeats):
                 report["phase"] = "measurement"
                 report["samples"].append(
@@ -380,7 +427,7 @@ def run_benchmark(args):
                 with torch.autograd.graph.saved_tensors_hooks(counter.pack, counter.unpack):
                     iteration(calculator, parameters, probe, args.mode, meter, active)
                 report["saved_tensors"] = counter.report()
-            if args.trace:
+            if args.profile or args.trace:
                 report["phase"] = "profiler"
                 activities = [torch.profiler.ProfilerActivity.CPU]
                 if meter.cuda:
@@ -389,17 +436,20 @@ def run_benchmark(args):
                     activities=activities, profile_memory=True, record_shapes=True
                 ) as profiler:
                     iteration(calculator, parameters, probe, args.mode, meter, active)
-                profiler.export_chrome_trace(str(args.trace))
-                trace = json.loads(args.trace.read_text())
-                for key in ("host_name", "traceName", "deviceProperties", "distributedInfo"):
-                    trace.pop(key, None)
-                args.trace.write_text(json.dumps(trace))
+                report["profiler"] = kernel_summary(profiler)
+                if args.trace:
+                    profiler.export_chrome_trace(str(args.trace))
+                    trace = json.loads(args.trace.read_text())
+                    for key in ("host_name", "traceName", "deviceProperties", "distributedInfo"):
+                        trace.pop(key, None)
+                    args.trace.write_text(json.dumps(trace))
             report["status"] = "ok"
             report.pop("phase", None)
     except torch.OutOfMemoryError:
         report["status"] = "oom"
         report["operation"] = active[0]
         report["oom_peak"] = meter.peak()
+        report["warmup_summary"] = summarize(report["warmup_samples"])
         report["summary"] = summarize(report["samples"])
     finally:
         torch.set_float32_matmul_precision(previous_precision)

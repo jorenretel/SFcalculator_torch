@@ -3,6 +3,7 @@
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -37,10 +38,15 @@ def test_cpu_measurements(arguments, mode):
     assert torch.get_num_threads() == threads
     assert torch.get_float32_matmul_precision() == precision
     assert len(result["samples"]) == 2
+    assert len(result["warmup_samples"]) == arguments.warmup
+    assert result["first_call"] == result["warmup_samples"][0]
+    assert result["warmup_summary"] == benchmark.summarize(result["warmup_samples"])
+    assert result["summary"] == benchmark.summarize(result["samples"])
+    assert "cache-dependent" in result["measurement_notes"]["first_call"].lower()
     assert result["input"]["atoms"] == 11
     assert result["input"]["asu_reflections"] == 257
     assert result["summary"]["peak_allocated_bytes"] is None
-    for sample in result["samples"]:
+    for sample in result["warmup_samples"] + result["samples"]:
         assert sample["forward"]["wall_ms"] > 0
         assert sample["forward"]["cuda_ms"] is None
         assert sample["before"]["allocated_bytes"] is None
@@ -54,6 +60,110 @@ def test_cpu_measurements(arguments, mode):
     assert "trace" not in result["settings"]
     assert str(arguments.output.parent) not in json.dumps(result)
     assert all(not Path(name).is_absolute() for name in result["code"]["source_sha256"])
+
+
+@pytest.mark.parametrize(
+    "backend, expected",
+    [(None, "streamed"), ("dense", "dense"), ("streamed", "streamed"), ("compiled", "compiled")],
+)
+def test_backend_option(backend, expected):
+    command = ["--output", "unused.json"]
+    if backend is not None:
+        command.extend(["--backend", backend])
+    assert benchmark.build_parser().parse_args(command).backend == expected
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:0"])
+def test_compiled_requires_available_cuda(arguments, monkeypatch, device):
+    arguments.backend = "compiled"
+    arguments.device = device
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    def must_not_load_inputs(args):
+        pytest.fail("Compiled backend must reject unsupported devices before loading inputs")
+
+    monkeypatch.setattr(benchmark, "inputs", must_not_load_inputs)
+    message = "compiled backend requires CUDA" if device == "cpu" else "CUDA unavailable"
+    with pytest.raises(ValueError, match=message):
+        benchmark.run_benchmark(arguments)
+
+
+@pytest.mark.parametrize("mode", ["forward", "coordinates", "all"])
+def test_first_call_and_warmup_are_excluded_from_steady_state(arguments, monkeypatch, mode):
+    arguments.mode = mode
+    arguments.warmup = 2
+    samples = [
+        {
+            "forward": {"wall_ms": duration, "cuda_ms": None},
+            "backward": {"wall_ms": 2 * duration, "cuda_ms": None} if mode != "forward" else None,
+            "peak_allocated_bytes": peak,
+            "incremental_peak_allocated_bytes": peak - 100,
+        }
+        for duration, peak in [(100, 1000), (40, 800), (2, 200), (4, 300)]
+    ]
+    pending = iter(samples)
+    monkeypatch.setattr(benchmark, "iteration", lambda *args: next(pending))
+    result = benchmark.run_benchmark(arguments)
+    assert result["status"] == "ok"
+    assert result["first_call"] == samples[0]
+    assert result["warmup_samples"] == samples[:2]
+    assert result["samples"] == samples[2:]
+    for key, durations, peak, incremental in (
+        ("warmup_summary", (40, 100), 1000, 900),
+        ("summary", (2, 4), 300, 200),
+    ):
+        summary = result[key]
+        assert summary["forward_wall_ms"] == {
+            "median": sum(durations) / 2,
+            "min": durations[0],
+            "max": durations[1],
+        }
+        if mode == "forward":
+            assert "backward_wall_ms" not in summary
+        else:
+            assert summary["backward_wall_ms"] == {
+                "median": sum(durations),
+                "min": 2 * durations[0],
+                "max": 2 * durations[1],
+            }
+        assert summary["peak_allocated_bytes"] == peak
+        assert summary["incremental_peak_allocated_bytes"] == incremental
+    assert next(pending, None) is None
+
+
+def test_kernel_summary_aggregates_cuda_events():
+    def event(name, duration):
+        return SimpleNamespace(
+            name=name,
+            device_type=torch.autograd.DeviceType.CUDA,
+            time_range=SimpleNamespace(elapsed_us=lambda: duration),
+        )
+
+    profiler = SimpleNamespace(
+        events=lambda: [
+            event("fused_tile", 3.0),
+            SimpleNamespace(name="host_op", device_type=torch.autograd.DeviceType.CPU),
+            event("other_kernel", 10.0),
+            event("fused_tile", 5.0),
+        ]
+    )
+    summary = benchmark.kernel_summary(profiler)
+    assert summary["cuda_kernel_calls"] == 3
+    assert summary["cuda_kernel_total_us"] == 18.0
+    assert summary["kernels"] == [
+        {"name": "other_kernel", "calls": 1, "total_us": 10.0},
+        {"name": "fused_tile", "calls": 2, "total_us": 8.0},
+    ]
+    json.dumps(summary, allow_nan=False)
+
+
+@pytest.mark.parametrize("cpu_only", [False, True])
+def test_kernel_summary_without_cuda_events(cpu_only):
+    events = [SimpleNamespace(device_type=torch.autograd.DeviceType.CPU)] if cpu_only else []
+    summary = benchmark.kernel_summary(SimpleNamespace(events=lambda: events))
+    assert summary["cuda_kernel_calls"] == 0
+    assert summary["cuda_kernel_total_us"] == 0
+    assert summary["kernels"] == []
 
 
 def test_full_reflection_scaling(arguments):
