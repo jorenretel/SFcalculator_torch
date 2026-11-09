@@ -22,6 +22,31 @@ To install this package:
  
 For a walkthrough tutorial, check this page: https://rs-station.github.io/SFcalculator_torch/
 
+### Memory-bounded structure factors
+
+The existing dense backend remains the default. For large single-model calculations,
+select reflection tiles at construction instead of full atom-by-reflection intermediates:
+
+```python
+from SFC_Torch import SFcalculator
+
+calculator = SFcalculator(
+    "model.pdb", dmin=3.0, set_experiment=False, device="cuda:0",
+    fprotein_backend="compiled", reflection_chunk_size=8192,
+)
+fprotein = calculator.calc_fprotein(Return=True)
+```
+
+`"streamed"` uses the original arithmetic with non-reentrant checkpointing on CPU
+or CUDA, trading recomputation for memory. `"compiled"` additionally fuses tile
+arithmetic with `torch.compile`/Inductor (tested with PyTorch 2.7); it requires CUDA
+development headers and `ptxas`, incurs first-use compilation, and supports only
+first-order gradients. Use `"streamed"` for higher-order derivatives. Larger tiles
+use more memory; compact inputs and outputs still scale with reflection count.
+Do not mutate inputs before backward finishes. Reading or assigning the legacy
+`fullsf_tensor` intentionally restores dense execution to preserve in-place edits;
+batched calculations also remain dense.
+
 ### Citing
 
 ```
