@@ -12,6 +12,7 @@ Written in PyTorch
 from __future__ import annotations
 
 from typing import Optional, List
+from numbers import Integral
 import gemmi
 import time
 import numpy as np
@@ -26,6 +27,7 @@ from .utils import vdw_rad_tensor, unitcell_grid_center, bin_by_logarithmic
 from .utils import r_factor, assert_numpy, assert_tensor
 from .packingscore import packingscore_voxelgrid_torch
 from .io import PDBParser
+from .streaming import f_protein_streamed
 
 class SFcalculator(object):
     """
@@ -46,6 +48,8 @@ class SFcalculator(object):
         testset_value:  int = 0,
         device:         torch.device = try_gpu(),
         mode:           str = "xray",
+        fprotein_backend: str = "streamed",
+        reflection_chunk_size: int = 2048,
     ) -> None:
         """
         Initialize with necessary reusable information, like spacegroup, unit cell info, HKL_list, et.c.
@@ -90,8 +94,25 @@ class SFcalculator(object):
 
         mode: str, default xray
             xray or cryoem, use xray atomic factors or elelctron atomic factors
+
+        fprotein_backend: str, default streamed
+            Stream reflection tiles with recomputation-based autograd, or use
+            the legacy dense calculation with "dense".
+
+        reflection_chunk_size: int, default 2048
+            Positive number of reflections per streamed tile. Backward recomputes
+            tiles rather than retaining their dense atom-by-reflection tensors.
         """
-        
+        if fprotein_backend not in ("streamed", "dense"):
+            raise ValueError("fprotein_backend must be 'streamed' or 'dense'")
+        if isinstance(reflection_chunk_size, (bool, np.bool_)) or not isinstance(
+            reflection_chunk_size, Integral
+        ):
+            raise TypeError("reflection_chunk_size must be a positive integer")
+        if reflection_chunk_size <= 0:
+            raise ValueError("reflection_chunk_size must be positive")
+        self.fprotein_backend = fprotein_backend
+        self.reflection_chunk_size = int(reflection_chunk_size)
         self.wavelength = wavelength
         self.anomalous = anomalous
         self.device = device
@@ -541,17 +562,40 @@ class SFcalculator(object):
                 )
                 self.full_atomic_sf_asu[atom_type] = f0
 
-        if self.anomalous:
-            self.fullsf_tensor = torch.tensor(
-                np.array([self.full_atomic_sf_asu[atom] for atom in self.atom_name]),
-                device=self.device,
-            ).type(torch.complex64)
-        else:
-            self.fullsf_tensor = torch.tensor(
-                np.array([self.full_atomic_sf_asu[atom] for atom in self.atom_name]),
-                device=self.device,
-            ).type(torch.float32)
+        atom_types = list(self.full_atomic_sf_asu)
+        type_index = {atom: i for i, atom in enumerate(atom_types)}
+        self._scattering_by_type = torch.tensor(
+            np.asarray([self.full_atomic_sf_asu[atom] for atom in atom_types]),
+            dtype=torch.complex64 if self.anomalous else torch.float32,
+            device=self.device,
+        )
+        self._atom_type_indices = torch.tensor(
+            [type_index[atom] for atom in self.atom_name],
+            dtype=torch.long,
+            device=self.device,
+        )
+        self._fullsf_tensor = None
 
+    @property
+    def fullsf_tensor(self):
+        """Legacy dense scattering table, materialized only on explicit access.
+
+        Access caches the table so existing in-place mutations remain effective.
+        Single-model calculations then use that table through the dense backend.
+        Batched-model calculations also retain their legacy dense behavior.
+        """
+        if self._fullsf_tensor is None:
+            # This cache outlives the caller's context and must remain usable by
+            # later gradient calculations and in-place edits outside inference.
+            with torch.inference_mode(False):
+                self._fullsf_tensor = self._scattering_by_type.index_select(
+                    0, self._atom_type_indices
+                )
+        return self._fullsf_tensor
+
+    @fullsf_tensor.setter
+    def fullsf_tensor(self, value):
+        self._fullsf_tensor = value
 
     def assign_resolution_bins(
         self, bins=10, Nmin=100, return_labels=False, format_str=".2f"
@@ -689,18 +733,36 @@ class SFcalculator(object):
         if not atoms_occ_tensor is None:
             self.atom_occ = atoms_occ_tensor
 
-        self.Fprotein_asu = F_protein(
-            self.Hasu_array,
-            self.dr2asu_array,
-            self.fullsf_tensor,
-            self.R_G_tensor_stack,
-            self.T_G_tensor_stack,
-            self.orth2frac_tensor,
-            self.atom_pos_frac,
-            self.atom_b_iso,
-            self.atom_aniso_uw,
-            self.atom_occ,
-        )
+        if self.fprotein_backend == "streamed" and self._fullsf_tensor is None:
+            self.Fprotein_asu = f_protein_streamed(
+                self.Hasu_array,
+                self.dr2asu_array,
+                self._scattering_by_type,
+                self._atom_type_indices,
+                self.R_G_tensor_stack,
+                self.T_G_tensor_stack,
+                self.orth2frac_tensor,
+                self.atom_pos_frac,
+                self.atom_b_iso,
+                self.atom_aniso_uw,
+                self.atom_occ,
+                chunk_size=self.reflection_chunk_size,
+            )
+        elif self.fprotein_backend in ("dense", "streamed"):
+            self.Fprotein_asu = F_protein(
+                self.Hasu_array,
+                self.dr2asu_array,
+                self.fullsf_tensor,
+                self.R_G_tensor_stack,
+                self.T_G_tensor_stack,
+                self.orth2frac_tensor,
+                self.atom_pos_frac,
+                self.atom_b_iso,
+                self.atom_aniso_uw,
+                self.atom_occ,
+            )
+        else:
+            raise ValueError("fprotein_backend must be 'streamed' or 'dense'")
         if not self.HKL_array is None:
             self.Fprotein_HKL = self.Fprotein_asu[self.asu2HKL_index]
             self.Fmask_HKL = torch.zeros_like(self.Fprotein_HKL)
